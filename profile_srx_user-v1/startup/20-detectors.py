@@ -1,0 +1,1 @@
+../../profile_xf05id1/startup/20-detectors.py

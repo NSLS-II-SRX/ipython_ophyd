@@ -5,27 +5,44 @@ setup_ophyd()
 # Make plots update live while scans run.
 from bluesky.utils import install_qt_kicker
 install_qt_kicker()
+from metadatastore.mds import MDS
+# from metadataclient.mds import MDS
+from databroker import Broker
+from databroker.core import register_builtin_handlers
+from filestore.fs import FileStore
 
+# pull from /etc/metadatastore/connection.yaml
+mds = MDS({'host': 'xf05id-ca1',
+           'database': 'datastore',
+           'port': 27017,
+           'timezone': 'US/Eastern'}, auth=False)
+# mds = MDS({'host': CA, 'port': 7770})
+
+# pull configuration from /etc/filestore/connection.yaml
+db = Broker(mds, FileStore({'host': 'xf05id-ca1',
+                            'database': 'filestore',
+                            'port': 27017,
+                            'timezone': 'US/Eastern',
+                            }))
+register_builtin_handlers(db.fs)
 
 # Subscribe metadatastore to documents.
 # If this is removed, data is not saved to metadatastore.
-import metadatastore.commands
+
 from bluesky.global_state import gs
-gs.RE.subscribe_lossless('all', metadatastore.commands.insert)
+gs.RE.subscribe_lossless('all', mds.insert)
 
 # convenience imports
 from ophyd.commands import *
 from bluesky.callbacks import *
 from bluesky.spec_api import *
 from bluesky.global_state import gs, abort, stop, resume
-from databroker import (DataBroker as db, get_events, get_images,
-                        get_table, get_fields, restream, process)
 from time import sleep
 import numpy as np
 
 RE = gs.RE  # convenience alias
 gs.RE.md['beamline_id'] = 'xf05id'
-
+gs.RE.record_interruptions = True
 
 import matplotlib.pyplot as plt
 import matplotlib
@@ -46,37 +63,3 @@ def relabel_motors(dev):
 
 
 from ophyd import PseudoSingle, PseudoPositioner, Signal
-
-
-class FixedPseudoSingle(PseudoSingle):
-    """Adds missing methods
-
-    This will need to be removed when Positioner is fixed upstream
-    """
-    def read(self):
-        return {self.name: {'value': self.position,
-                            'timestamp': ttime.time()}}
-    
-    def describe(self):
-        return {self.name: {'dtype': 'number',
-                            'shape': [],
-                            'source': 'computed',
-                            'units': 'keV'}}
-
-    def read_configuration(self):
-        return {}
-    
-    def describe_configuration(self):
-        return {}
-                                
-
-class MagicSetPseudoPositioner(PseudoPositioner):
-    def set(self, *args):
-        v = self.PseudoPosition(*args)
-        return super().set(v)
-
-
-class PermissiveGetSignal(Signal):
-    def get(self, use_monitor=None):
-        return super().get()
-

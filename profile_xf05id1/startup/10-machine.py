@@ -4,17 +4,21 @@ from ophyd import (PVPositioner, EpicsSignal, EpicsSignalRO, EpicsMotor,
                    Device, Signal, PseudoPositioner, PseudoSingle)
 from ophyd.utils.epics_pvs import set_and_wait
 from ophyd.ophydobj import StatusBase, MoveStatus
+from ophyd.pseudopos import (pseudo_position_argument, real_position_argument)
 from ophyd import Component as Cpt
 from scipy.interpolate import InterpolatedUnivariateSpline
 
 ring_current = EpicsSignalRO('SR:C03-BI{DCCT:1}I:Real-I', name='ring_current')
 
-class UVDone(PermissiveGetSignal):
-    def __init__(self, parent, brake, readback, **kwargs):
+class UVDone(Signal):
+    def __init__(self, parent, brake, readback, err, stp, **kwargs):
         super().__init__(parent=parent, value=1, **kwargs)
         self._rbv = readback
         self._brake = brake
         self._started = False
+        self._err = err
+        self._stp = stp
+        self.target = None
 
     def put(self, *arg, **kwargs):
         raise TypeError("You con not tell an undulator it is done")
@@ -28,6 +32,8 @@ class UVDone(PermissiveGetSignal):
         cur_value = rbv.get()
         brake = getattr(self.parent, self._brake)
         brake_on = brake.get()
+
+        err_str = getattr(self.parent, self._err).get()
         if not self._started:
             self._started = not brake_on
         # come back and check this threshold value
@@ -38,15 +44,55 @@ class UVDone(PermissiveGetSignal):
             brake.clear_sub(self._watcher)
             self._started = False
 
-        elif brake_on and self._started:
-            print(self.parent.name, ": reactuated due to not reaching target")
-            self.parent.actuate.put(self.parent.actuate_value)
+        elif brake_on:
+            if err_str:
+                self._put(1)
+                rbv.clear_sub(self._watcher)
+                brake.clear_sub(self._watcher)
+                self._started = False
+            elif self._started:
+                print(self.parent.name, ": reactuated due to not reaching target")
+                self.parent.actuate.put(self.parent.actuate_value)
+
+    def _stop_watcher(self, *arg, **kwargs):
+        '''Call back to be installed on the stop signal
+
+        if this gets flipped, clear all of the other callbacks and tell
+        the status object that it is done.
+
+        TODO: mark status object as failed
+        TODO: only trigger this on 0 -> 1 transposition
+        '''
+        print('STOPPED')
+        # set the target to None and remove all callbacks
+        self.reset(None)
+        # flip this signal to 1 to signal it is done
+        self._put(1)
+        # push stop again 'just to be safe'
+        # this is paranoia related to the re-kicking the motor is the
+        # other callback
+        stop = getattr(self.parent, self._stp)
+        stop.put(1)
 
     def reset(self, target):
+        self.target = float(target)
         self._put(0)
-        self.target = target
+        self._remove_cbs()
         self._started = False
+ 
+    def _remove_cbs(self):
+        rbv = getattr(self.parent, self._rbv)
+        stop = getattr(self.parent, self._stp)
+        moving = getattr(self.parent, self._brake)
 
+        rbv.clear_sub(self._watcher)
+        moving.clear_sub(self._watcher)
+        stop.clear_sub(self._stop_watcher)
+
+    def stop(self):
+        self.reset(None)
+        self._put(1)
+        
 
 class URealPos(Device):
     #undulator real position, gap and taper
@@ -103,6 +149,9 @@ class FixedPVPositioner(PVPositioner):
                                 event_type=self.brake_on.SUB_VALUE)
         self.readback.subscribe(self.done._watcher,
                                 event_type=self.readback.SUB_VALUE)
+
+        self.stop_signal.subscribe(self.done._stop_watcher,
+                                   event_type=self.stop_signal.SUB_VALUE, run=False)
         return ret
 
 
@@ -114,7 +163,8 @@ class Undulator(FixedPVPositioner):
     actuate = Cpt(EpicsSignal, '-Mtr:2}Sw:Go')
     actuate_value = 1
     done = Cpt(UVDone, None, brake='brake_on',
-               readback='readback', add_prefix=())
+               readback='readback', err='err', stp='stop_signal',
+               add_prefix=())
 
     # correction function signals, need to be merged into single object
     corrfunc_en = Cpt(EpicsSignal, '-MtrC}EnaAdj:out')
@@ -129,6 +179,9 @@ class Undulator(FixedPVPositioner):
     pos = Cpt(UPos, '')
     girder = Cpt(Girder, '')
     elevation = Cpt(Elev, '')
+
+    # error status
+    err = Cpt(EpicsSignalRO, '-Motor}Err:GetCerr_.VALA', string=True)
 
     def move(self, v, *args, moved_cb=None, **kwargs):
         kwargs['timeout'] = None
@@ -163,18 +216,43 @@ class Undulator(FixedPVPositioner):
         self.etoulookup = InterpolatedUnivariateSpline(elistIn, uposlistIn)
         self.utoelookup = InterpolatedUnivariateSpline(uposlistIn, elistIn)
 
+    def _move_changed(self, timestamp=None, value=None, sub_type=None,
+                      **kwargs):
+        was_moving = self._moving
+        self._moving = (value != self.done_value)
+
+        started = False
+        if not self._started_moving:
+            started = self._started_moving = (not was_moving and self._moving)
+
+        if started:
+            self._run_subs(sub_type=self.SUB_START, timestamp=timestamp,
+                           value=value, **kwargs)
+
+        if not self.put_complete:
+            success = not bool(self.err.get())
+            # In the case of put completion, motion complete
+            if was_moving and not self._moving:
+                self._done_moving(success=success, timestamp=timestamp,
+                                  value=value)
+
+    def stop(self):
+        self.done.stop()
+        return super().stop()
 
 _undulator_kwargs = dict(name='ivu1_gap', read_attrs=['readback'],
                          calib_path='/nfs/xf05id1/UndulatorCalibration/',
-                         calib_file='SRXUgapCalibration20150411_final.text',
+                         #calib_file='SRXUgapCalibration20150411_final.text',
+                         calib_file='SRXUgapCalibration20160608_final.text',                                                  
                          configuration_attrs=['corrfunc_sta', 'pos', 'girder',
                                               'real_pos', 'elevation'])
+
 
 ANG_OVER_EV = 12.3984
 
 class Energy(PseudoPositioner):
     # synthetic axis
-    energy = Cpt(FixedPseudoSingle)
+    energy = Cpt(PseudoSingle)
     # real motors
     u_gap = Cpt(Undulator, 'SR:C5-ID:G1{IVU21:1', add_prefix=(), **_undulator_kwargs)
     bragg = Cpt(EpicsMotor, 'XF:05IDA-OP:1{Mono:HDCM-Ax:P}Mtr', add_prefix=(),
@@ -182,12 +260,12 @@ class Energy(PseudoPositioner):
     c2_x = Cpt(EpicsMotor, 'XF:05IDA-OP:1{Mono:HDCM-Ax:X2}Mtr', add_prefix=(),
                 read_attrs=['user_readback'])
     # motor enable flags
-    move_u_gap = Cpt(PermissiveGetSignal, None, add_prefix=(), value=True)
-    move_c2_x = Cpt(PermissiveGetSignal, None, add_prefix=(), value=True)
-    harmonic = Cpt(PermissiveGetSignal, None, add_prefix=(), value=None)
+    move_u_gap = Cpt(Signal, None, add_prefix=(), value=True)
+    move_c2_x = Cpt(Signal, None, add_prefix=(), value=True)
+    harmonic = Cpt(Signal, None, add_prefix=(), value=None)
 
     # experimental
-    detune = Cpt(PermissiveGetSignal, None, add_prefix=(), value=0)
+    detune = Cpt(Signal, None, add_prefix=(), value=0)
 
     def energy_to_positions(self, target_energy, undulator_harmonic, u_detune):
         """Compute undulator and mono positions given a target energy
@@ -281,6 +359,7 @@ class Energy(PseudoPositioner):
 
         return XoffsetVal
 
+    @pseudo_position_argument
     def forward(self, p_pos):
         energy = p_pos.energy
         harmonic = self.harmonic.get()
@@ -316,10 +395,15 @@ class Energy(PseudoPositioner):
 
         return self.RealPosition(bragg=bragg, c2_x=c2_x, u_gap=u_gap)
 
+    @real_position_argument
     def inverse(self, r_pos):
         bragg = r_pos.bragg
-        e = ANG_OVER_EV / (2 * self._d_111 * np.sin(np.deg2rad(bragg + self._delta_bragg)))
-        return self.PseudoPosition(energy=e)
+        e = ANG_OVER_EV / (2 * self._d_111 * math.sin(math.radians(bragg + self._delta_bragg)))
+        return self.PseudoPosition(energy=float(e))
+
+    @pseudo_position_argument
+    def set(self, position):
+        return super().set([float(_) for _ in position])
 
 # change it to a better way to pass the calibration
 cal_data_2016cycle1 = {'d_111': 3.12961447804,
@@ -328,8 +412,10 @@ cal_data_2016cycle1 = {'d_111': 3.12961447804,
                        'T2cal': 13.463294326,
                        'xoffset': 25.2521}
 
-cal_data_2016cycle2 = {'d_111': 3.12924894907,  # 2016/1/27 (Se, Cu, Fe, Ti)
+cal_data_2016cycle1_2 = {'d_111': 3.12924894907,  # 2016/1/27 (Se, Cu, Fe, Ti)
                        'delta_bragg': 0.315532509387,  # 2016/1/27 (Se, Cu, Fe, Ti)
+                       'delta_bragg': 0.317124613301,  # ? before 8/18/2016
+                       #'delta_bragg': 0.357124613301,  # 2016/8/16 (Cu)
                        # not in energy axis but for the record
                        # 'C1Rcal' :  -4.88949983261, # 2016/1/29
                        'C2Xcal': 3.6,  # 2016/1/29
@@ -349,10 +435,44 @@ cal_data_2016cycle2 = {'d_111': 3.12924894907,  # 2016/1/27 (Se, Cu, Fe, Ti)
                        #mono warmed up at 4/12/16
                        #'xoffset': 24.809838976060604 #17keV
                        #'xoffset': 24.887490886653893 #8.2 keV
-                       'xoffset': 24.770168843970197 #12.5 keV
+                       #'xoffset': 24.770168843970197 #12.5 keV
                        }  # 2016/1/29}
 
-energy = Energy(prefix='', name='energy', **cal_data_2016cycle2)
+                        #2016-2
+cal_data_2016cycle2  ={ #'d_111': 3.13130245128, #2016/6/9 (Ti, Cr, Fe, Cu, Se)
+                        'd_111': 3.12929567478, #2016/8/1 (Ti, Fe, Cu, Se)
+                        #'delta_bragg' : 0.309366522013,
+                        #'delta_bragg' : 0.32936652201300004,
+                        #'delta_bragg': 0.337124613301, 
+                        'delta_bragg': 0.317124613301, #2016/8/16 (Ti, Cr, Fe, Cu, Se)
+                        #'xoffset': 24.864494684263519,                                             
+                        'C2Xcal': 3.6,  # 2016/1/29
+                        'T2cal': 14.2470486188,
+                        #'xoffset': 25.941277803299684
+                        #'xoffset': 25.921698318063775
+                        #'xoffset': 25.802588306223701 #2016/7/5 17.5 keV 
+                        #'xoffset': 25.542954465467645 #2016/7/6 17.5 keV fullfield
+                        #'xoffset': 25.39464922124886 #2016/7/20 13.5/6 keV microscopy
+                        #'xoffset': 25.354968816872358 #2016/7/28 12-14 keV microscopy
+                        #'xoffset': 25.414219669872864 #2016/8/2 14 keV
+                        #'xoffset': 25.175826062860775 #2016/8/2 18 keV
+                        #'xoffset': 25.527059255709876 #2016/8/16 9 keV
+                        #'xoffset': 25.487723997622723 #2016/8/18 11 keV
+                        'xoffset': 25.488305806234468, #2016/8/21 9.2 keV, aligned by Garth on 2016/8/20
+                        #'C1Rcal':-4.7089492561 for the record
+                      }
+
+
+cal_data_2016cycle3  ={'d_111': 3.12941028109, #2016/10/3 (Ti, Fe, Cu, Se)
+                       'delta_bragg': 0.317209816326, #2016/10/3 (Ti, Fe, Cu, Se)
+                        'C2Xcal': 3.6,  # 2016/1/29
+                        'T2cal': 14.2470486188,
+                        'xoffset': 25.056582386746765, #2016/10/3 9 keV
+                        #'C1Rcal': -5.03023390228  #for the record, 2016/10/3
+                      }
+
+
+energy = Energy(prefix='', name='energy', **cal_data_2016cycle3)
 
 
 # Front End Slits (Primary Slits)
@@ -369,6 +489,6 @@ class SRXShutter(Device):
     open_cmd = Cpt(EpicsSignal, 'Cmd:Opn-Cmd')
     close_status = Cpt(EpicsSignalRO, 'Sts:Cls-Sts')
 
-shut_fe = SRXShutter('XF:05IDB-PPS{Sh:WB}', name='shut_fe')
+shut_fe = SRXShutter('XF:05ID-PPS{Sh:WB}', name='shut_fe')
 shut_a = SRXShutter('XF:05IDA-PPS:1{PSh:2}', name='shut_a')
 shut_b = SRXShutter('XF:05IDB-PPS:1{PSh:4}', name='shut_b')
