@@ -8,12 +8,17 @@ from ophyd.areadetector.filestore_mixins import (FileStoreIterativeWrite,
                                                  FileStoreHDF5IterativeWrite,
                                                  FileStoreTIFFSquashing,
                                                  FileStoreTIFF)
+from hxntools.detectors.xspress3 import (XspressTrigger, Xspress3Detector,
+                                         Xspress3Channel, Xspress3FileStore)
+
 from ophyd import Signal
 from ophyd import Component as C
+
 
 class SRXTIFFPlugin(TIFFPlugin, FileStoreTIFF,
                     FileStoreIterativeWrite):
     file_number_sync = None
+
 
 class BPMCam(SingleTrigger, AreaDetector):
     cam = C(AreaDetectorCam, '')
@@ -21,7 +26,8 @@ class BPMCam(SingleTrigger, AreaDetector):
 
     tiff = C(SRXTIFFPlugin, 'TIFF1:',
              #write_path_template='/epicsdata/bpm1-cam1/2016/2/24/')
-             write_path_template='/epicsdata/bpm1-cam1/%Y/%m/%d/')
+             write_path_template='/epicsdata/bpm1-cam1/%Y/%m/%d/',
+             root='/epicsdata')
 
     stats1 = C(StatsPlugin, 'Stats1:')
     stats2 = C(StatsPlugin, 'Stats2:')
@@ -30,7 +36,7 @@ class BPMCam(SingleTrigger, AreaDetector):
     # this is flakey?
     # stats5 = C(StatsPlugin, 'Stats5:')
     pass
-                               
+
 bpmAD = BPMCam('XF:05IDA-BI:1{BPM:1-Cam:1}', name='bpmAD', read_attrs=['tiff'])
 bpmAD.read_attrs = ['tiff', 'stats1', 'stats2', 'stats3', 'stats4']
 bpmAD.tiff.read_attrs = []
@@ -51,7 +57,8 @@ class SRXPixirad(SingleTrigger,AreaDetector):
     stats3 = C(StatsPlugin, 'Stats3:')
     stats4 = C(StatsPlugin, 'Stats4:')
     tiff = C(SRXTIFFPlugin, 'TIFF1:',
-             write_path_template='/epicsdata/pixirad/%Y/%m/%d/')
+             write_path_template='/epicsdata/pixirad/%Y/%m/%d/',
+             root='/epicsdata')
 
 #pixi = SRXPixirad('XF:05IDD-ES:1{Det:Pixi}', name='pixi', read_attrs=['stats1','stats2','stats3','stats4','tiff'])
 #pixi.stats1.read_attrs = ['total','centroid','sigma_x','sigma_y']
@@ -68,7 +75,8 @@ class SRXHFVLMCam(SingleTrigger,AreaDetector):
     stats3 = C(StatsPlugin, 'Stats3:')
     stats4 = C(StatsPlugin, 'Stats4:')
     tiff = C(SRXTIFFPlugin, 'TIFF1:',
-             write_path_template='/epicsdata/hfvlm/%Y/%m/%d/')
+             write_path_template='/epicsdata/hfvlm/%Y/%m/%d/',
+             root='/epicsdata')
 
 hfvlmAD = SRXHFVLMCam('XF:05IDD-BI:1{Mscp:1-Cam:1}', name='hfvlm', read_attrs=['tiff'])
 hfvlmAD.read_attrs = ['tiff', 'stats1', 'stats2', 'stats3', 'stats4']
@@ -80,8 +88,6 @@ hfvlmAD.stats4.read_attrs = ['total']
 
 
 
-from hxntools.detectors.xspress3 import (XspressTrigger, Xspress3Detector,
-                                         Xspress3Channel, Xspress3FileStore)
 
 class SrxXspress3Detector(XspressTrigger, Xspress3Detector):
     # TODO: garth, the ioc is missing some PVs?
@@ -99,7 +105,8 @@ class SrxXspress3Detector(XspressTrigger, Xspress3Detector):
 
     hdf5 = Cpt(Xspress3FileStore, 'HDF5:',
                read_path_template='/data/XSPRESS3/2016-1/',
-               write_path_template='/epics/data/2016-1/')
+               write_path_template='/epics/data/2016-1/',
+               root='/epics')
 
     def __init__(self, prefix, *, configuration_attrs=None, read_attrs=None,
                  **kwargs):
@@ -110,7 +117,7 @@ class SrxXspress3Detector(XspressTrigger, Xspress3Detector):
             read_attrs = ['channel1', 'channel2', 'channel3', 'hdf5']
         super().__init__(prefix, configuration_attrs=configuration_attrs,
                          read_attrs=read_attrs, **kwargs)
-                         
+
     def stop(self):
         ret = super.stop()
         self.hdf5.stop()
